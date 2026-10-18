@@ -1,0 +1,182 @@
+name: Build GreyDM
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Generate project
+        run: |
+          mkdir -p proj/app/src/main/java/com/grey/dm proj/app/src/main/res/xml proj/app/src/main/res/drawable
+          cd proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GreyDM"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.1.0" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.grey.dm"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.grey.dm"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging { jniLibs { useLegacyPackaging = true } }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+          }
+          EOF
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <paths><external-path name="all" path="."/></paths>
+          EOF
+          cat > app/src/main/res/drawable/ic.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#2A2A2D" android:pathData="M0,0h108v108h-108z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M48,30h12v28h14L54,80L34,58h14z"/>
+          </vector>
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+              <application
+                  android:name=".App"
+                  android:label="GreyDM"
+                  android:icon="@drawable/ic"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:requestLegacyExternalStorage="true"
+                  android:extractNativeLibs="true"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".AddActivity" android:exported="true" android:label="GreyDM"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar"
+                      android:taskAffinity="" android:excludeFromRecents="true"
+                      android:launchMode="singleTop" android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <data android:mimeType="text/plain"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <category android:name="android.intent.category.BROWSABLE"/>
+                          <data android:scheme="http"/>
+                          <data android:scheme="https"/>
+                          <data android:mimeType="video/*"/>
+                          <data android:mimeType="audio/*"/>
+                          <data android:mimeType="application/octet-stream"/>
+                          <data android:mimeType="application/vnd.apple.mpegurl"/>
+                          <data android:mimeType="application/x-mpegurl"/>
+                          <data android:mimeType="application/zip"/>
+                          <data android:mimeType="application/vnd.android.package-archive"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <category android:name="android.intent.category.BROWSABLE"/>
+                          <data android:scheme="http"/>
+                          <data android:scheme="https"/>
+                          <data android:host="*"/>
+                          <data android:pathPattern=".*\\.m3u8"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".DlService" android:exported="false" android:foregroundServiceType="dataSync"/>
+                  <provider android:name="androidx.core.content.FileProvider" android:authorities="com.grey.dm.fp"
+                      android:exported="false" android:grantUriPermissions="true">
+                      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/>
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/grey/dm/MainActivity.kt <<'EOF'
+          @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+          package com.grey.dm
+
+          import android.Manifest
+          import android.app.Application
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color as AColor
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.webkit.MimeTypeMap
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.setContent
+          import androidx.a
