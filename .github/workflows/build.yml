@@ -179,4 +179,733 @@ jobs:
           import androidx.activity.ComponentActivity
           import androidx.activity.SystemBarStyle
           import androidx.activity.compose.setContent
-          import androidx.a
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.window.Dialog
+          import androidx.compose.ui.window.DialogProperties
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.core.content.FileProvider
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import okhttp3.Call
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.net.URLDecoder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.UUID
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+
+          const val UA = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+          val GreyBg = Color(0xFF161618)
+          val GreyCard = Color(0xFF242427)
+          val GreyHi = Color(0xFF2F2F33)
+          val GreyText2 = Color(0xFF9A9A9F)
+          val GreyTrack = Color(0xFF3A3A3E)
+
+          enum class St { QUEUED, DOWNLOADING, PAUSED, STOPPED, ERROR, FINISHED }
+
+          class Dl(val id: String, val url: String, val created: Long) {
+              var name by mutableStateOf("")
+              var status by mutableStateOf(St.QUEUED)
+              var progress by mutableFloatStateOf(0f)
+              var done by mutableLongStateOf(0L)
+              var total by mutableLongStateOf(-1L)
+              var speed by mutableLongStateOf(0L)
+              var error by mutableStateOf("")
+              var path by mutableStateOf("")
+              var userName = ""
+              var kind = 0 // 0 unknown, 1 file, 2 stream (yt-dlp)
+          }
+
+          fun clean(s: String): String =
+              s.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").trim().take(150)
+
+          fun firstUrl(t: String): String? =
+              Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE).find(t)?.value
+
+          fun hasExt(s: String) = Regex("\\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,5}$").containsMatchIn(s)
+
+          fun fileName(disp: String?, url: String, ct: String): String {
+              val fromDisp = disp?.let { dd ->
+                  Regex("filename\\*=(?:UTF-8|utf-8)''([^;]+)").find(dd)?.groupValues?.get(1)
+                      ?.let { runCatching { URLDecoder.decode(it.trim('"', ' '), "UTF-8") }.getOrNull() }
+                      ?: Regex("filename=\"?([^\";]+)\"?").find(dd)?.groupValues?.get(1)
+              }
+              var s = clean(listOf(fromDisp, Uri.parse(url).lastPathSegment).firstOrNull { !it.isNullOrBlank() } ?: "download")
+              if (!hasExt(s)) {
+                  val e = MimeTypeMap.getSingleton().getExtensionFromMimeType(ct.substringBefore(';').trim())
+                  if (e != null) s += ".$e"
+              }
+              return s
+          }
+
+          fun fmtSize(b: Long): String {
+              if (b < 1024) return "$b B"
+              val u = arrayOf("KB", "MB", "GB", "TB")
+              var v = b / 1024.0
+              var i = 0
+              while (v >= 1024 && i < 3) { v /= 1024; i++ }
+              return String.format(Locale.US, "%.1f %s", v, u[i])
+          }
+          fun fmtSpeed(b: Long) = fmtSize(b) + "/s"
+          fun fmtTime(s: Long) = when {
+              s >= 3600 -> "${s / 3600}h ${(s % 3600) / 60}m"
+              s >= 60 -> "${s / 60}m ${s % 60}s"
+              else -> "${s}s"
+          }
+          fun sz(n: String, u: String): Long {
+              val v = n.toDoubleOrNull() ?: return 0L
+              val m = when (u[0]) { 'K' -> 1024.0; 'M' -> 1048576.0; 'G' -> 1073741824.0; 'T' -> 1.0995e12; else -> 1.0 }
+              return (v * m).toLong()
+          }
+          val RX_SPEED = Regex("at\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)/s")
+          val RX_TOTAL = Regex("of\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)")
+
+          object Perm {
+              fun has(c: Context): Boolean =
+                  if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
+                  else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+          }
+
+          object Engine {
+              lateinit var app: Application
+              val items = mutableStateListOf<Dl>()
+              var maxConc by mutableIntStateOf(2) // 0 = unlimited
+              var limitKB by mutableIntStateOf(0) // 0 = unlimited
+              @Volatile var active = 1
+              val main = Handler(Looper.getMainLooper())
+              private val pool = Executors.newCachedThreadPool()
+              private val tasks = HashMap<String, Task>()
+              private val prefs get() = app.getSharedPreferences("dm", 0)
+              val http: OkHttpClient = OkHttpClient.Builder()
+                  .followRedirects(true).followSslRedirects(true)
+                  .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
+              val dir get() = File(Environment.getExternalStorageDirectory(), "GreyDM")
+              @Volatile private var ytReady = false
+              private var saveQueued = false
+
+              fun ui(f: () -> Unit) { if (Looper.myLooper() == Looper.getMainLooper()) f() else main.post { f() } }
+
+              fun init(a: Application) {
+                  app = a
+                  maxConc = prefs.getInt("conc", 2)
+                  limitKB = prefs.getInt("limit", 0)
+                  try {
+                      val arr = JSONArray(prefs.getString("items", "[]"))
+                      val list = ArrayList<Dl>()
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          val d = Dl(o.getString("id"), o.getString("url"), o.getLong("created"))
+                          d.name = o.optString("name"); d.userName = o.optString("un"); d.kind = o.optInt("kind")
+                          d.status = St.valueOf(o.optString("st", "QUEUED"))
+                          d.progress = o.optDouble("p", 0.0).toFloat(); d.done = o.optLong("done"); d.total = o.optLong("total", -1)
+                          d.error = o.optString("err"); d.path = o.optString("path")
+                          if (d.status == St.DOWNLOADING) d.status = St.PAUSED
+                          list.add(d)
+                      }
+                      items.addAll(list.sortedByDescending { it.created })
+                  } catch (_: Exception) {}
+              }
+
+              fun save() {
+                  synchronized(this) { if (saveQueued) return; saveQueued = true }
+                  main.postDelayed({ saveQueued = false; doSave() }, 1500)
+              }
+              private fun doSave() {
+                  val arr = JSONArray()
+                  items.forEach { d ->
+                      arr.put(JSONObject().put("id", d.id).put("url", d.url).put("created", d.created).put("name", d.name)
+                          .put("un", d.userName).put("kind", d.kind).put("st", d.status.name).put("p", d.progress.toDouble())
+                          .put("done", d.done).put("total", d.total).put("err", d.error).put("path", d.path))
+                  }
+                  prefs.edit().putString("items", arr.toString()).apply()
+              }
+
+              fun setLimits(conc: Int, kb: Int) {
+                  maxConc = conc; limitKB = kb
+                  prefs.edit().putInt("conc", conc).putInt("limit", kb).apply()
+                  ui { pump() }
+              }
+
+              fun add(url: String, name: String) {
+                  val d = Dl(UUID.randomUUID().toString().take(8), url.trim(), System.currentTimeMillis())
+                  d.userName = name.trim(); d.name = clean(name.trim())
+                  ui { items.add(0, d); save(); pump() }
+              }
+
+              fun pump() {
+                  if (!Perm.has(app)) return
+                  var slots = if (maxConc <= 0) Int.MAX_VALUE else maxConc - items.count { it.status == St.DOWNLOADING }
+                  for (d in items.filter { it.status == St.QUEUED }.sortedBy { it.created }) {
+                      if (slots <= 0) break
+                      d.status = St.DOWNLOADING; d.error = ""; d.speed = 0
+                      val t = Task(d); tasks[d.id] = t; pool.execute(t)
+                      slots--
+                  }
+                  active = maxOf(1, items.count { it.status == St.DOWNLOADING })
+                  if (items.any { it.status == St.DOWNLOADING }) {
+                      try { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) } catch (_: Exception) {}
+                  }
+              }
+
+              fun perTaskLimit(): Long = if (limitKB <= 0) 0L else limitKB * 1024L / active
+
+              fun finish(t: Task, st: St, err: String) {
+                  if (tasks[t.d.id] !== t) return
+                  tasks.remove(t.d.id)
+                  t.d.status = st; t.d.speed = 0; t.d.error = err
+                  if (st == St.FINISHED) t.d.progress = 1f
+                  save(); pump()
+              }
+
+              fun pause(d: Dl) = ui {
+                  tasks.remove(d.id)?.abort(1)
+                  if (d.status == St.DOWNLOADING || d.status == St.QUEUED) { d.status = St.PAUSED; d.speed = 0; save(); pump() }
+              }
+              fun stop(d: Dl) = ui {
+                  tasks.remove(d.id)?.abort(2)
+                  if (d.status == St.DOWNLOADING || d.status == St.QUEUED || d.status == St.PAUSED) { d.status = St.STOPPED; d.speed = 0; save(); pump() }
+              }
+              fun resume(d: Dl) = ui {
+                  if (d.status == St.PAUSED || d.status == St.STOPPED || d.status == St.ERROR) { d.status = St.QUEUED; d.error = ""; save(); pump() }
+              }
+              fun remove(d: Dl, delFile: Boolean) = ui {
+                  tasks.remove(d.id)?.abort(3)
+                  items.remove(d)
+                  Thread {
+                      if (delFile && d.path.isNotBlank()) File(d.path).delete()
+                      File(dir, ".tmp/${d.id}.part").delete()
+                      File(dir, ".tmp/${d.id}").deleteRecursively()
+                  }.start()
+                  save(); pump()
+              }
+              fun clearFinished() = ui { items.removeAll { it.status == St.FINISHED }; save() }
+
+              @Synchronized fun ensureYtdl() {
+                  if (ytReady) return
+                  YoutubeDL.getInstance().init(app)
+                  FFmpeg.getInstance().init(app)
+                  ytReady = true
+              }
+
+              fun unique(dir: File, name: String): File {
+                  dir.mkdirs()
+                  var f = File(dir, name)
+                  if (!f.exists()) return f
+                  val base = f.nameWithoutExtension
+                  val ext = f.extension.let { if (it.isEmpty()) "" else ".$it" }
+                  var i = 1
+                  while (File(dir, "$base ($i)$ext").also { f = it }.exists()) i++
+                  return f
+              }
+
+              fun moveInto(src: File, name: String): File {
+                  val out = unique(dir, name)
+                  if (!src.renameTo(out)) { src.copyTo(out, true); src.delete() }
+                  return out
+              }
+
+              fun shortErr(e: Throwable): String {
+                  val m = e.message ?: e.javaClass.simpleName
+                  return (m.lines().lastOrNull { it.contains("ERROR") } ?: m.lines().firstOrNull { it.isNotBlank() } ?: m).take(200)
+              }
+          }
+
+          class Task(val d: Dl) : Runnable {
+              @Volatile var cancel = 0 // 1 pause, 2 stop, 3 remove
+              @Volatile var call: Call? = null
+
+              fun abort(c: Int) {
+                  cancel = c
+                  call?.cancel()
+                  if (d.kind == 2) try { YoutubeDL.getInstance().destroyProcessById(d.id) } catch (_: Throwable) {}
+              }
+
+              override fun run() {
+                  try {
+                      if (d.kind == 0) probe()
+                      if (d.kind == 2) runStream() else runFile()
+                      Engine.ui { Engine.finish(this, St.FINISHED, "") }
+                  } catch (e: Throwable) {
+                      if (cancel == 0) Engine.ui { Engine.finish(this, St.ERROR, Engine.shortErr(e)) }
+                  }
+              }
+
+              private fun probe() {
+                  val low = d.url.lowercase().substringBefore('?')
+                  if (low.endsWith(".m3u8") || low.endsWith(".mpd") || d.url.contains(".m3u8")) {
+                      d.kind = 2
+                      return
+                  }
+                  val c = Engine.http.newCall(Request.Builder().url(d.url).header("User-Agent", UA).header("Range", "bytes=0-0").build())
+                  call = c
+                  c.execute().use { r ->
+                      if (!r.isSuccessful && r.code != 416) throw IOException("HTTP ${r.code}")
+                      val ct = (r.header("Content-Type") ?: "").lowercase()
+                      if (ct.contains("mpegurl") || ct.contains("dash+xml") || ct.contains("text/html")) {
+                          d.kind = 2
+                          return
+                      }
+                      d.kind = 1
+                      val auto = fileName(r.header("Content-Disposition"), r.request.url.toString(), ct)
+                      d.name = if (d.userName.isBlank()) auto else {
+                          val u = clean(d.userName)
+                          val e = auto.substringAfterLast('.', "")
+                          if (hasExt(u) || e.isEmpty()) u else "$u.$e"
+                      }
+                  }
+              }
+
+              private fun finalize(out: File) {
+                  d.name = out.name; d.path = out.path; d.total = out.length(); d.done = d.total; d.progress = 1f; d.speed = 0
+                  MediaScannerConnection.scanFile(Engine.app, arrayOf(out.path), null, null)
+              }
+
+              private fun runFile() {
+                  val tmp = File(Engine.dir, ".tmp").apply { mkdirs() }
+                  File(tmp, ".nomedia").createNewFile()
+                  val part = File(tmp, "${d.id}.part")
+                  var attempts = 0
+                  while (true) {
+                      try { download(part); break }
+                      catch (e: Exception) {
+                          if (cancel != 0 || ++attempts >= 4 || e.message?.startsWith("HTTP") == true) throw e
+                          Thread.sleep(1500L * attempts)
+                      }
+                  }
+                  finalize(Engine.moveInto(part, d.name.ifBlank { "download" }))
+              }
+
+              private fun download(part: File) {
+                  var off = if (part.exists()) part.length() else 0L
+                  val rb = Request.Builder().url(d.url).header("User-Agent", UA)
+                  if (off > 0) rb.header("Range", "bytes=$off-")
+                  val c = Engine.http.newCall(rb.build())
+                  call = c
+                  if (cancel != 0) throw IOException("cancelled")
+                  c.execute().use { r ->
+                      if (r.code == 416 && off > 0) return
+                      if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                      val append = r.code == 206 && off > 0
+                      if (!append) off = 0
+                      val body = r.body!!
+                      val len = body.contentLength()
+                      d.total = if (len >= 0) len + off else -1L
+                      d.done = off
+                      d.progress = if (d.total > 0) d.done.toFloat() / d.total else -1f
+                      FileOutputStream(part, append).use { o ->
+                          val inp = body.byteStream()
+                          val buf = ByteArray(65536)
+                          var win = System.currentTimeMillis(); var winB = 0L
+                          var tick = win; var tickB = 0L
+                          while (true) {
+                              if (cancel != 0) throw IOException("cancelled")
+                              val n = inp.read(buf)
+                              if (n < 0) break
+                              o.write(buf, 0, n)
+                              d.done += n; winB += n; tickB += n
+                              var now = System.currentTimeMillis()
+                              val lim = Engine.perTaskLimit()
+                              if (lim > 0) {
+                                  val wait = winB * 1000 / lim - (now - win)
+                                  if (wait > 0) { Thread.sleep(minOf(wait, 1000L)); now = System.currentTimeMillis() }
+                                  if (now - win >= 1000) { win = now; winB = 0 }
+                              }
+                              if (now - tick >= 500) {
+                                  d.speed = tickB * 1000 / (now - tick); tick = now; tickB = 0
+                                  d.progress = if (d.total > 0) d.done.toFloat() / d.total else -1f
+                                  Engine.save()
+                              }
+                          }
+                      }
+                      if (d.total > 0 && d.done < d.total) throw IOException("Connection closed early")
+                  }
+              }
+
+              private fun runStream() {
+                  Engine.ensureYtdl()
+                  val tmp = File(Engine.dir, ".tmp/${d.id}").apply { mkdirs() }
+                  File(Engine.dir, ".tmp/.nomedia").createNewFile()
+                  val req = YoutubeDLRequest(d.url)
+                  req.addOption("-o", tmp.path + "/%(title).150B.%(ext)s")
+                  req.addOption("--no-playlist")
+                  req.addOption("--newline")
+                  req.addOption("--no-mtime")
+                  req.addOption("-S", "vcodec:h264,res,acodec:m4a")
+                  req.addOption("--merge-output-format", "mp4")
+                  req.addOption("--remux-video", "mp4")
+                  req.addOption("--concurrent-fragments", "4")
+                  val lim = Engine.perTaskLimit()
+                  if (lim > 0) req.addOption("--limit-rate", "${maxOf(1L, lim / 1024)}K")
+                  d.progress = -1f
+                  YoutubeDL.getInstance().execute(req, d.id) { p, _, line ->
+                      if (p >= 0f) d.progress = p / 100f
+                      RX_SPEED.find(line)?.let { d.speed = sz(it.groupValues[1], it.groupValues[2]) }
+                      RX_TOTAL.find(line)?.let {
+                          val t = sz(it.groupValues[1], it.groupValues[2])
+                          if (t > 0) { d.total = t; if (p >= 0f) d.done = (t * p / 100f).toLong() }
+                      }
+                      Engine.save()
+                  }
+                  val files = tmp.listFiles()?.filter { it.isFile && !Regex("\\.(part|ytdl|temp|tmp)$").containsMatchIn(it.name) } ?: emptyList()
+                  val f = files.maxByOrNull { it.length() } ?: throw IllegalStateException("No output file produced")
+                  val ext = f.extension.ifEmpty { "mp4" }
+                  val base = (if (d.userName.isNotBlank()) clean(d.userName) else f.nameWithoutExtension).removeSuffix(".$ext")
+                  val out = Engine.moveInto(f, "$base.$ext")
+                  tmp.deleteRecursively()
+                  finalize(out)
+              }
+          }
+
+          class App : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  Engine.init(this)
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      getSystemService(NotificationManager::class.java)
+                          .createNotificationChannel(NotificationChannel("dm", "Downloads", NotificationManager.IMPORTANCE_LOW))
+                  }
+              }
+          }
+
+          class DlService : Service() {
+              private val h = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (Engine.items.none { it.status == St.DOWNLOADING || it.status == St.QUEUED }) { stopSelf(); return }
+                      getSystemService(NotificationManager::class.java).notify(1, build())
+                      h.postDelayed(this, 1000)
+                  }
+              }
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  ServiceCompat.startForeground(this, 1, build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  h.removeCallbacks(tick); h.post(tick)
+                  return START_NOT_STICKY
+              }
+              override fun onDestroy() { h.removeCallbacks(tick) }
+              private fun build(): Notification {
+                  val act = Engine.items.filter { it.status == St.DOWNLOADING }
+                  val text = if (act.isEmpty()) "Waiting…" else "${act.size} downloading · ${fmtSpeed(act.sumOf { it.speed })}"
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  return NotificationCompat.Builder(this, "dm").setSmallIcon(android.R.drawable.stat_sys_download)
+                      .setContentTitle("GreyDM").setContentText(text).setOngoing(true).setOnlyAlertOnce(true).setContentIntent(pi).build()
+              }
+          }
+
+          @Composable
+          fun GreyTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Color.White, onPrimary = Color.Black, secondary = Color.White, onSecondary = Color.Black,
+                      background = GreyBg, onBackground = Color.White, surface = GreyCard, onSurface = Color.White,
+                      surfaceVariant = GreyHi, onSurfaceVariant = GreyText2, outline = Color(0xFF555559)
+                  ), content = content
+              )
+          }
+
+          fun openFile(c: Context, d: Dl, share: Boolean = false) {
+              val f = File(d.path)
+              if (!f.exists()) { Toast.makeText(c, "File not found", Toast.LENGTH_SHORT).show(); return }
+              val uri = FileProvider.getUriForFile(c, c.packageName + ".fp", f)
+              val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+              val i = if (share) Intent.createChooser(Intent(Intent.ACTION_SEND).setType(mime).putExtra(Intent.EXTRA_STREAM, uri)
+                  .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null)
+              else Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              try { c.startActivity(i) } catch (e: Exception) { Toast.makeText(c, "No app to open this", Toast.LENGTH_SHORT).show() }
+          }
+
+          fun statusLine(d: Dl): String = when (d.status) {
+              St.QUEUED -> "Queued"
+              St.DOWNLOADING -> {
+                  val p = ArrayList<String>()
+                  if (d.progress >= 0f) p.add("${(d.progress * 100).toInt()}%")
+                  if (d.total > 0) p.add("${fmtSize(d.done)} / ${fmtSize(d.total)}") else if (d.done > 0) p.add(fmtSize(d.done))
+                  if (d.speed > 0) p.add(fmtSpeed(d.speed))
+                  if (d.speed > 0 && d.total > d.done) p.add(fmtTime((d.total - d.done) / d.speed))
+                  if (p.isEmpty()) "Starting…" else p.joinToString(" · ")
+              }
+              St.PAUSED -> "Paused" + (if (d.progress > 0f) " · ${(d.progress * 100).toInt()}%" else "")
+              St.STOPPED -> "Stopped"
+              St.ERROR -> "Error · ${d.error}"
+              St.FINISHED -> "Finished · ${fmtSize(d.total)} · " + SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()).format(Date(d.created))
+          }
+
+          @Composable
+          fun fieldColors() = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = Color.White, unfocusedBorderColor = Color(0xFF555559),
+              cursorColor = Color.White, focusedLabelColor = Color.White
+          )
+
+          @Composable
+          fun EditorCard(url0: String, onCancel: () -> Unit, onAdd: (String, String) -> Unit) {
+              var name by remember { mutableStateOf("") }
+              var url by remember(url0) { mutableStateOf(url0) }
+              val clip = LocalClipboardManager.current
+              Card(
+                  colors = CardDefaults.cardColors(containerColor = GreyCard),
+                  shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)
+              ) {
+                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Text("Add download", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                      OutlinedTextField(
+                          value = name, onValueChange = { name = it }, singleLine = true,
+                          label = { Text("File name (blank = auto)") }, colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                          trailingIcon = {
+                              IconButton(onClick = {
+                                  val t = clip.getText()?.text
+                                  if (!t.isNullOrBlank()) name = t.lines().first().trim()
+                              }) { Icon(Icons.Default.ContentPaste, "Paste name") }
+                          })
+                      OutlinedTextField(
+                          value = url, onValueChange = { url = it }, maxLines = 3,
+                          label = { Text("Link") }, colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                          trailingIcon = {
+                              IconButton(onClick = {
+                                  val t = clip.getText()?.text
+                                  if (!t.isNullOrBlank()) url = firstUrl(t) ?: t.trim()
+                              }) { Icon(Icons.Default.ContentPaste, "Paste link") }
+                          })
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                          TextButton(onClick = onCancel) { Text("Cancel", color = Color.White) }
+                          Spacer(Modifier.width(8.dp))
+                          Button(
+                              enabled = url.trim().startsWith("http", true),
+                              onClick = { onAdd(name, url.trim()) },
+                              colors = ButtonDefaults.buttonColors(
+                                  containerColor = Color.White, contentColor = Color.Black,
+                                  disabledContainerColor = GreyTrack, disabledContentColor = GreyText2
+                              )
+                          ) { Text("Add") }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SettingsDialog(onClose: () -> Unit) {
+              var conc by remember { mutableIntStateOf(Engine.maxConc) }
+              var lim by remember { mutableStateOf(if (Engine.limitKB > 0) Engine.limitKB.toString() else "") }
+              AlertDialog(
+                  onDismissRequest = onClose, containerColor = GreyCard,
+                  title = { Text("Settings") },
+                  text = {
+                      Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          Text("Simultaneous downloads", fontSize = 13.sp, color = GreyText2)
+                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              listOf(1, 2, 3, 4, 5, 8, 0).forEach { n ->
+                                  FilterChip(
+                                      selected = conc == n, onClick = { conc = n },
+                                      label = { Text(if (n == 0) "Unlimited" else "$n") },
+                                      colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color.White, selectedLabelColor = Color.Black)
+                                  )
+                              }
+                          }
+                          OutlinedTextField(
+                              value = lim, onValueChange = { lim = it.filter(Char::isDigit).take(7) }, singleLine = true,
+                              label = { Text("Speed limit KB/s (blank = none)") }, colors = fieldColors(),
+                              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                          )
+                          TextButton(onClick = { Engine.clearFinished() }) { Text("Clear finished from list", color = Color.White) }
+                      }
+                  },
+                  confirmButton = { TextButton(onClick = { Engine.setLimits(conc, lim.toIntOrNull() ?: 0); onClose() }) { Text("Save", color = Color.White) } },
+                  dismissButton = { TextButton(onClick = onClose) { Text("Cancel", color = Color.White) } }
+              )
+          }
+
+          @Composable
+          fun DlRow(d: Dl) {
+              val ctx = LocalContext.current
+              val clip = LocalClipboardManager.current
+              var menu by remember { mutableStateOf(false) }
+              val st = d.status
+              Card(
+                  colors = CardDefaults.cardColors(containerColor = GreyCard), shape = RoundedCornerShape(14.dp),
+                  modifier = Modifier.fillMaxWidth().clickable(enabled = st == St.FINISHED) { openFile(ctx, d) }
+              ) {
+                  Row(Modifier.padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Column(Modifier.weight(1f)) {
+                          Text(d.name.ifBlank { Uri.parse(d.url).host ?: d.url }, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                          Spacer(Modifier.height(3.dp))
+                          Text(statusLine(d), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                              color = if (st == St.ERROR) Color(0xFFFF8A80) else GreyText2)
+                          if (st == St.DOWNLOADING || st == St.PAUSED) {
+                              Spacer(Modifier.height(8.dp))
+                              if (d.progress >= 0f) LinearProgressIndicator(
+                                  progress = { d.progress.coerceIn(0f, 1f) },
+                                  modifier = Modifier.fillMaxWidth().height(4.dp), color = Color.White, trackColor = GreyTrack
+                              ) else LinearProgressIndicator(
+                                  modifier = Modifier.fillMaxWidth().height(4.dp), color = Color.White, trackColor = GreyTrack
+                              )
+                          }
+                      }
+                      when (st) {
+                          St.DOWNLOADING, St.QUEUED -> IconButton(onClick = { Engine.pause(d) }) { Icon(Icons.Default.Pause, "Pause") }
+                          St.PAUSED -> IconButton(onClick = { Engine.resume(d) }) { Icon(Icons.Default.PlayArrow, "Resume") }
+                          St.STOPPED, St.ERROR -> IconButton(onClick = { Engine.resume(d) }) { Icon(Icons.Default.Refresh, "Retry") }
+                          St.FINISHED -> IconButton(onClick = { openFile(ctx, d) }) { Icon(Icons.Default.OpenInNew, "Open") }
+                      }
+                      Box {
+                          IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More") }
+                          DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                              if (st == St.DOWNLOADING || st == St.QUEUED || st == St.PAUSED)
+                                  DropdownMenuItem(text = { Text("Stop") }, onClick = { menu = false; Engine.stop(d) })
+                              if (st == St.FINISHED)
+                                  DropdownMenuItem(text = { Text("Share") }, onClick = { menu = false; openFile(ctx, d, true) })
+                              DropdownMenuItem(text = { Text("Copy link") }, onClick = { menu = false; clip.setText(AnnotatedString(d.url)) })
+                              DropdownMenuItem(text = { Text("Remove from list") }, onClick = { menu = false; Engine.remove(d, false) })
+                              if (st == St.FINISHED)
+                                  DropdownMenuItem(text = { Text("Delete file") }, onClick = { menu = false; Engine.remove(d, true) })
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Home(granted: Boolean, onGrant: () -> Unit) {
+              var showEditor by remember { mutableStateOf(false) }
+              var editorUrl by remember { mutableStateOf("") }
+              var showSettings by remember { mutableStateOf(false) }
+              val clip = LocalClipboardManager.current
+              val act = Engine.items.filter { it.status == St.DOWNLOADING }
+              val summary = if (act.isEmpty()) "${Engine.items.size} items · idle" else "${act.size} active · ${fmtSpeed(act.sumOf { it.speed })}"
+              Scaffold(
+                  containerColor = GreyBg,
+                  topBar = {
+                      TopAppBar(
+                          title = { Column { Text("GreyDM", fontWeight = FontWeight.Bold); Text(summary, fontSize = 12.sp, color = GreyText2) } },
+                          actions = { IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Settings, "Settings") } },
+                          colors = TopAppBarDefaults.topAppBarColors(containerColor = GreyBg, titleContentColor = Color.White, actionIconContentColor = Color.White)
+                      )
+                  },
+                  floatingActionButton = {
+                      if (granted) FloatingActionButton(
+                          onClick = { editorUrl = firstUrl(clip.getText()?.text ?: "") ?: ""; showEditor = true },
+                          containerColor = Color.White, contentColor = Color.Black
+                      ) { Icon(Icons.Default.ContentPaste, "Paste link") }
+                  }
+              ) { pad ->
+                  Box(Modifier.padding(pad).fillMaxSize()) {
+                      if (!granted) {
+                          Column(Modifier.align(Alignment.Center).padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                              Text("GreyDM needs access to storage to save downloads to the GreyDM folder.", color = GreyText2)
+                              Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) { Text("Grant access") }
+                          }
+                      } else if (Engine.items.isEmpty()) {
+                          Text("Tap paste to add a link,\nor share a link to GreyDM from your browser.", color = GreyText2, modifier = Modifier.align(Alignment.Center).padding(32.dp))
+                      } else {
+                          LazyColumn(contentPadding = PaddingValues(12.dp, 4.dp, 12.dp, 96.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              items(Engine.items, key = { it.id }) { DlRow(it) }
+                          }
+                      }
+                  }
+              }
+              if (showEditor) Dialog(onDismissRequest = { showEditor = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                  EditorCard(editorUrl, { showEditor = false }) { n, u -> Engine.add(u, n); showEditor = false }
+              }
+              if (showSettings) SettingsDialog { showSettings = false }
+          }
+
+          class MainActivity : ComponentActivity() {
+              private val granted = mutableStateOf(false)
+              private val reqStorage = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+              private val reqNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(statusBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT), navigationBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT))
+                  if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      reqNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  setContent { GreyTheme { Home(granted.value) { grant() } } }
+              }
+              override fun onResume() { super.onResume(); refresh() }
+              private fun refresh() {
+                  granted.value = Perm.has(this)
+                  if (granted.value) { Engine.dir.mkdirs(); Engine.pump() }
+              }
+              private fun grant() {
+                  if (Build.VERSION.SDK_INT >= 30)
+                      startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                  else reqStorage.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+              }
+          }
+
+          class AddActivity : ComponentActivity() {
+              private val link = mutableStateOf("")
+              private fun extract(i: Intent): String = firstUrl(i.getStringExtra(Intent.EXTRA_TEXT) ?: "") ?: i.dataString ?: ""
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(statusBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT), navigationBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT))
+                  link.value = extract(intent)
+                  setContent {
+                      GreyTheme {
+                          Box(
+                              Modifier.fillMaxSize().background(Color(0x99000000))
+                                  .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { finish() }
+                                  .imePadding().navigationBarsPadding(),
+                              contentAlignment = Alignment.BottomCenter
+                          ) {
+                              Box(Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }) {
+                                  EditorCard(link.value, { finish() }) { n, u ->
+                                      if (!Perm.has(this@AddActivity)) {
+                                          Toast.makeText(this@AddActivity, "Grant storage access in GreyDM first", Toast.LENGTH_LONG).show()
+                                          startActivity(Intent(this@AddActivity, MainActivity::class.java))
+                                      } else {
+                                          Engine.add(u, n)
+                                          Toast.makeText(this@AddActivity, "Added to GreyDM", Toast.LENGTH_SHORT).show()
+                                      }
+                                      finish()
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); link.value = extract(intent) }
+          }
+          EOF
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GreyDM
+          path: proj/app/build/outputs/apk/debug/*.apk
