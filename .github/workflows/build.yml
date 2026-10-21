@@ -215,14 +215,19 @@ jobs:
           import com.yausername.ffmpeg.FFmpeg
           import com.yausername.youtubedl_android.YoutubeDL
           import com.yausername.youtubedl_android.YoutubeDLRequest
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
           import okhttp3.Call
           import okhttp3.OkHttpClient
           import okhttp3.Request
           import org.json.JSONArray
           import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
           import java.io.File
           import java.io.FileOutputStream
           import java.io.IOException
+          import java.net.URI
           import java.net.URLDecoder
           import java.text.SimpleDateFormat
           import java.util.Date
@@ -250,8 +255,11 @@ jobs:
               var error by mutableStateOf("")
               var path by mutableStateOf("")
               var userName = ""
+              var fmt = ""
               var kind = 0 // 0 unknown, 1 file, 2 stream (yt-dlp)
           }
+
+          class Variant(val label: String, val url: String, val height: Int, val sepAudio: Boolean)
 
           fun clean(s: String): String =
               s.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").trim().take(150)
@@ -297,6 +305,56 @@ jobs:
           val RX_SPEED = Regex("at\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)/s")
           val RX_TOTAL = Regex("of\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)")
 
+          // Returns the list of resolutions if url is an HLS master playlist, else empty.
+          fun fetchVariants(url: String): List<Variant> {
+              val req = Request.Builder().url(url).header("User-Agent", UA).build()
+              return Engine.http.newCall(req).execute().use { r ->
+                  if (!r.isSuccessful) return@use emptyList<Variant>()
+                  val body = r.body ?: return@use emptyList<Variant>()
+                  val ins = body.byteStream()
+                  val tmp = ByteArray(8192)
+                  val n0 = ins.read(tmp)
+                  if (n0 <= 0) return@use emptyList<Variant>()
+                  val head = String(tmp, 0, minOf(n0, 64), Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r')
+                  if (!head.startsWith("#EXTM3U")) return@use emptyList<Variant>()
+                  val bos = ByteArrayOutputStream()
+                  bos.write(tmp, 0, n0)
+                  while (bos.size() < 524288) {
+                      val n = ins.read(tmp)
+                      if (n < 0) break
+                      bos.write(tmp, 0, n)
+                  }
+                  val lines = bos.toString("UTF-8").lines().map { it.trim() }
+                  if (lines.none { it.startsWith("#EXT-X-STREAM-INF") }) return@use emptyList<Variant>()
+                  val base = r.request.url.toString()
+                  val audioGroups = HashSet<String>()
+                  for (l in lines) {
+                      if (l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") && l.contains("URI=")) {
+                          Regex("GROUP-ID=\"([^\"]+)\"").find(l)?.let { audioGroups.add(it.groupValues[1]) }
+                      }
+                  }
+                  val out = ArrayList<Variant>()
+                  var i = 0
+                  while (i < lines.size) {
+                      val l = lines[i]
+                      if (l.startsWith("#EXT-X-STREAM-INF")) {
+                          var j = i + 1
+                          while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
+                          if (j < lines.size) {
+                              val bw = Regex("(?:^|[:,])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                              val h = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                              val ag = Regex("AUDIO=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                              val abs = runCatching { URI(base).resolve(lines[j]).toString() }.getOrDefault(lines[j])
+                              val label = (if (h > 0) "${h}p" else "") + (if (bw > 0) (if (h > 0) " · " else "") + "${bw / 1000} kbps" else "")
+                              out.add(Variant(label.ifEmpty { "Stream" }, abs, h, ag != null && ag in audioGroups))
+                          }
+                          i = j
+                      } else i++
+                  }
+                  out.distinctBy { it.url }.sortedByDescending { it.height }
+              }
+          }
+
           object Perm {
               fun has(c: Context): Boolean =
                   if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
@@ -332,7 +390,7 @@ jobs:
                       for (i in 0 until arr.length()) {
                           val o = arr.getJSONObject(i)
                           val d = Dl(o.getString("id"), o.getString("url"), o.getLong("created"))
-                          d.name = o.optString("name"); d.userName = o.optString("un"); d.kind = o.optInt("kind")
+                          d.name = o.optString("name"); d.userName = o.optString("un"); d.kind = o.optInt("kind"); d.fmt = o.optString("fmt")
                           d.status = St.valueOf(o.optString("st", "QUEUED"))
                           d.progress = o.optDouble("p", 0.0).toFloat(); d.done = o.optLong("done"); d.total = o.optLong("total", -1)
                           d.error = o.optString("err"); d.path = o.optString("path")
@@ -351,21 +409,29 @@ jobs:
                   val arr = JSONArray()
                   items.forEach { d ->
                       arr.put(JSONObject().put("id", d.id).put("url", d.url).put("created", d.created).put("name", d.name)
-                          .put("un", d.userName).put("kind", d.kind).put("st", d.status.name).put("p", d.progress.toDouble())
+                          .put("un", d.userName).put("kind", d.kind).put("fmt", d.fmt).put("st", d.status.name).put("p", d.progress.toDouble())
                           .put("done", d.done).put("total", d.total).put("err", d.error).put("path", d.path))
                   }
                   prefs.edit().putString("items", arr.toString()).apply()
               }
 
               fun setLimits(conc: Int, kb: Int) {
+                  val changed = kb != limitKB
                   maxConc = conc; limitKB = kb
                   prefs.edit().putInt("conc", conc).putInt("limit", kb).apply()
-                  ui { pump() }
+                  ui {
+                      // stream (yt-dlp) downloads can't change speed live, so restart them with the new limit
+                      if (changed) items.filter { it.status == St.DOWNLOADING && it.kind == 2 }.forEach { d ->
+                          tasks.remove(d.id)?.abort(1)
+                          d.status = St.QUEUED; d.speed = 0
+                      }
+                      save(); pump()
+                  }
               }
 
-              fun add(url: String, name: String) {
+              fun add(url: String, name: String, fmt: String = "") {
                   val d = Dl(UUID.randomUUID().toString().take(8), url.trim(), System.currentTimeMillis())
-                  d.userName = name.trim(); d.name = clean(name.trim())
+                  d.userName = name.trim(); d.name = clean(name.trim()); d.fmt = fmt
                   ui { items.add(0, d); save(); pump() }
               }
 
@@ -450,11 +516,12 @@ jobs:
           class Task(val d: Dl) : Runnable {
               @Volatile var cancel = 0 // 1 pause, 2 stop, 3 remove
               @Volatile var call: Call? = null
+              val pid = d.id + "-" + System.nanoTime()
 
               fun abort(c: Int) {
                   cancel = c
                   call?.cancel()
-                  if (d.kind == 2) try { YoutubeDL.getInstance().destroyProcessById(d.id) } catch (_: Throwable) {}
+                  if (d.kind == 2) try { YoutubeDL.getInstance().destroyProcessById(pid) } catch (_: Throwable) {}
               }
 
               override fun run() {
@@ -473,12 +540,19 @@ jobs:
                       d.kind = 2
                       return
                   }
-                  val c = Engine.http.newCall(Request.Builder().url(d.url).header("User-Agent", UA).header("Range", "bytes=0-0").build())
+                  val c = Engine.http.newCall(Request.Builder().url(d.url).header("User-Agent", UA).header("Range", "bytes=0-1023").build())
                   call = c
                   c.execute().use { r ->
                       if (!r.isSuccessful && r.code != 416) throw IOException("HTTP ${r.code}")
                       val ct = (r.header("Content-Type") ?: "").lowercase()
-                      if (ct.contains("mpegurl") || ct.contains("dash+xml") || ct.contains("text/html")) {
+                      var head = ""
+                      if (r.code != 416) {
+                          val buf = ByteArray(1024)
+                          val n = r.body!!.byteStream().read(buf)
+                          if (n > 0) head = String(buf, 0, n, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r')
+                      }
+                      if (head.startsWith("#EXTM3U") || head.startsWith("<MPD") || (head.startsWith("<?xml") && head.contains("<MPD")) ||
+                          ct.contains("mpegurl") || ct.contains("dash+xml") || ct.contains("text/html")) {
                           d.kind = 2
                           return
                       }
@@ -546,7 +620,7 @@ jobs:
                                   val wait = winB * 1000 / lim - (now - win)
                                   if (wait > 0) { Thread.sleep(minOf(wait, 1000L)); now = System.currentTimeMillis() }
                                   if (now - win >= 1000) { win = now; winB = 0 }
-                              }
+                              } else { win = now; winB = 0 }
                               if (now - tick >= 500) {
                                   d.speed = tickB * 1000 / (now - tick); tick = now; tickB = 0
                                   d.progress = if (d.total > 0) d.done.toFloat() / d.total else -1f
@@ -567,6 +641,7 @@ jobs:
                   req.addOption("--no-playlist")
                   req.addOption("--newline")
                   req.addOption("--no-mtime")
+                  if (d.fmt.isNotBlank()) req.addOption("-f", d.fmt)
                   req.addOption("-S", "vcodec:h264,res,acodec:m4a")
                   req.addOption("--merge-output-format", "mp4")
                   req.addOption("--remux-video", "mp4")
@@ -574,7 +649,7 @@ jobs:
                   val lim = Engine.perTaskLimit()
                   if (lim > 0) req.addOption("--limit-rate", "${maxOf(1L, lim / 1024)}K")
                   d.progress = -1f
-                  YoutubeDL.getInstance().execute(req, d.id) { p, _, line ->
+                  YoutubeDL.getInstance().execute(req, pid) { p, _, line ->
                       if (p >= 0f) d.progress = p / 100f
                       RX_SPEED.find(line)?.let { d.speed = sz(it.groupValues[1], it.groupValues[2]) }
                       RX_TOTAL.find(line)?.let {
@@ -674,10 +749,29 @@ jobs:
           )
 
           @Composable
-          fun EditorCard(url0: String, onCancel: () -> Unit, onAdd: (String, String) -> Unit) {
+          fun EditorCard(url0: String, onCancel: () -> Unit, onAdd: (String, String, String) -> Unit) {
               var name by remember { mutableStateOf("") }
               var url by remember(url0) { mutableStateOf(url0) }
+              var variants by remember { mutableStateOf<List<Variant>>(emptyList()) }
+              var sel by remember { mutableIntStateOf(-1) }
+              var fmt by remember { mutableStateOf("") }
+              var master by remember { mutableStateOf("") }
+              var internal by remember { mutableStateOf("") }
+              var loading by remember { mutableStateOf(false) }
               val clip = LocalClipboardManager.current
+
+              LaunchedEffect(url) {
+                  if (url == internal) return@LaunchedEffect
+                  variants = emptyList(); sel = -1; fmt = ""; master = ""; loading = false
+                  if (!url.trim().startsWith("http", true)) return@LaunchedEffect
+                  delay(700)
+                  loading = true
+                  val found = withContext(Dispatchers.IO) { runCatching { fetchVariants(url.trim()) }.getOrDefault(emptyList()) }
+                  variants = found
+                  master = url.trim()
+                  loading = false
+              }
+
               Card(
                   colors = CardDefaults.cardColors(containerColor = GreyCard),
                   shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)
@@ -702,12 +796,36 @@ jobs:
                                   if (!t.isNullOrBlank()) url = firstUrl(t) ?: t.trim()
                               }) { Icon(Icons.Default.ContentPaste, "Paste link") }
                           })
+                      if (loading) Text("Checking for quality options…", fontSize = 12.sp, color = GreyText2)
+                      if (variants.isNotEmpty()) {
+                          Text("Quality (tap to pick, none = best)", fontSize = 13.sp, color = GreyText2)
+                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              variants.forEachIndexed { i, v ->
+                                  FilterChip(
+                                      selected = sel == i,
+                                      onClick = {
+                                          sel = i
+                                          if (v.sepAudio && v.height > 0) {
+                                              // audio is a separate track: keep master link and pick the resolution by filter
+                                              fmt = "bv*[height<=${v.height}]+ba/b[height<=${v.height}]"
+                                              internal = master; url = master
+                                          } else {
+                                              fmt = ""
+                                              internal = v.url; url = v.url
+                                          }
+                                      },
+                                      label = { Text(v.label) },
+                                      colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color.White, selectedLabelColor = Color.Black)
+                                  )
+                              }
+                          }
+                      }
                       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                           TextButton(onClick = onCancel) { Text("Cancel", color = Color.White) }
                           Spacer(Modifier.width(8.dp))
                           Button(
                               enabled = url.trim().startsWith("http", true),
-                              onClick = { onAdd(name, url.trim()) },
+                              onClick = { onAdd(name, url.trim(), fmt) },
                               colors = ButtonDefaults.buttonColors(
                                   containerColor = Color.White, contentColor = Color.Black,
                                   disabledContainerColor = GreyTrack, disabledContentColor = GreyText2
@@ -742,6 +860,7 @@ jobs:
                               label = { Text("Speed limit KB/s (blank = none)") }, colors = fieldColors(),
                               keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                           )
+                          Text("Video streams restart briefly when the limit changes (progress is kept).", fontSize = 11.sp, color = GreyText2)
                           TextButton(onClick = { Engine.clearFinished() }) { Text("Clear finished from list", color = Color.White) }
                       }
                   },
@@ -839,7 +958,7 @@ jobs:
                   }
               }
               if (showEditor) Dialog(onDismissRequest = { showEditor = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-                  EditorCard(editorUrl, { showEditor = false }) { n, u -> Engine.add(u, n); showEditor = false }
+                  EditorCard(editorUrl, { showEditor = false }) { n, u, f -> Engine.add(u, n, f); showEditor = false }
               }
               if (showSettings) SettingsDialog { showSettings = false }
           }
@@ -885,12 +1004,12 @@ jobs:
                               contentAlignment = Alignment.BottomCenter
                           ) {
                               Box(Modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }) {
-                                  EditorCard(link.value, { finish() }) { n, u ->
+                                  EditorCard(link.value, { finish() }) { n, u, f ->
                                       if (!Perm.has(this@AddActivity)) {
                                           Toast.makeText(this@AddActivity, "Grant storage access in GreyDM first", Toast.LENGTH_LONG).show()
                                           startActivity(Intent(this@AddActivity, MainActivity::class.java))
                                       } else {
-                                          Engine.add(u, n)
+                                          Engine.add(u, n, f)
                                           Toast.makeText(this@AddActivity, "Added to GreyDM", Toast.LENGTH_SHORT).show()
                                       }
                                       finish()
