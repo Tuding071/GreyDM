@@ -165,6 +165,10 @@ jobs:
           import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Color as AColor
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
           import android.media.MediaScannerConnection
           import android.net.Uri
           import android.os.Build
@@ -219,6 +223,7 @@ jobs:
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.withContext
           import okhttp3.Call
+          import okhttp3.HttpUrl.Companion.toHttpUrl
           import okhttp3.OkHttpClient
           import okhttp3.Request
           import org.json.JSONArray
@@ -227,14 +232,17 @@ jobs:
           import java.io.File
           import java.io.FileOutputStream
           import java.io.IOException
-          import java.net.URI
           import java.net.URLDecoder
+          import java.nio.ByteBuffer
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
           import java.util.UUID
           import java.util.concurrent.Executors
           import java.util.concurrent.TimeUnit
+          import javax.crypto.Cipher
+          import javax.crypto.spec.IvParameterSpec
+          import javax.crypto.spec.SecretKeySpec
 
           const val UA = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
           val GreyBg = Color(0xFF161618)
@@ -256,7 +264,7 @@ jobs:
               var path by mutableStateOf("")
               var userName = ""
               var fmt = ""
-              var kind = 0 // 0 unknown, 1 file, 2 stream (yt-dlp)
+              var kind = 0 // 0 unknown, 1 file, 2 stream
           }
 
           class Variant(val label: String, val url: String, val height: Int, val sepAudio: Boolean)
@@ -305,53 +313,112 @@ jobs:
           val RX_SPEED = Regex("at\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)/s")
           val RX_TOTAL = Regex("of\\s+~?\\s*([\\d.]+)\\s*([KMGT]?i?B)")
 
-          // Returns the list of resolutions if url is an HLS master playlist, else empty.
-          fun fetchVariants(url: String): List<Variant> {
+          // ---------- HLS helpers ----------
+          fun isHls(t: String) = t.trimStart('\uFEFF', ' ', '\n', '\r', '\t').startsWith("#EXTM3U")
+
+          fun attr(l: String, n: String): String? =
+              Regex("(?:^|[:,])" + n + "=(?:\"([^\"]*)\"|([^,]*))").find(l)?.let { m -> m.groupValues[1].ifEmpty { m.groupValues[2] } }
+
+          fun resolveUrl(base: String, ref: String): String =
+              runCatching { base.toHttpUrl().resolve(ref)?.toString() }.getOrNull() ?: ref
+
+          fun hexBytes(s: String): ByteArray =
+              s.removePrefix("0x").removePrefix("0X").padStart(32, '0').chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+          // returns (finalUrl, body) or null
+          fun fetchText(url: String): Pair<String, String>? {
               val req = Request.Builder().url(url).header("User-Agent", UA).build()
               return Engine.http.newCall(req).execute().use { r ->
-                  if (!r.isSuccessful) return@use emptyList<Variant>()
-                  val body = r.body ?: return@use emptyList<Variant>()
-                  val ins = body.byteStream()
-                  val tmp = ByteArray(8192)
-                  val n0 = ins.read(tmp)
-                  if (n0 <= 0) return@use emptyList<Variant>()
-                  val head = String(tmp, 0, minOf(n0, 64), Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r')
-                  if (!head.startsWith("#EXTM3U")) return@use emptyList<Variant>()
+                  if (!r.isSuccessful) return@use null
+                  val ins = r.body?.byteStream() ?: return@use null
                   val bos = ByteArrayOutputStream()
-                  bos.write(tmp, 0, n0)
-                  while (bos.size() < 524288) {
-                      val n = ins.read(tmp)
+                  val buf = ByteArray(8192)
+                  while (bos.size() < 4000000) {
+                      val n = ins.read(buf)
                       if (n < 0) break
-                      bos.write(tmp, 0, n)
+                      bos.write(buf, 0, n)
                   }
-                  val lines = bos.toString("UTF-8").lines().map { it.trim() }
-                  if (lines.none { it.startsWith("#EXT-X-STREAM-INF") }) return@use emptyList<Variant>()
-                  val base = r.request.url.toString()
-                  val audioGroups = HashSet<String>()
-                  for (l in lines) {
-                      if (l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") && l.contains("URI=")) {
-                          Regex("GROUP-ID=\"([^\"]+)\"").find(l)?.let { audioGroups.add(it.groupValues[1]) }
+                  Pair(r.request.url.toString(), bos.toString("UTF-8"))
+              }
+          }
+
+          fun parseVariants(base: String, lines: List<String>): List<Variant> {
+              val audioGroups = HashSet<String>()
+              for (l in lines) {
+                  if (l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") && l.contains("URI=")) {
+                      Regex("GROUP-ID=\"([^\"]+)\"").find(l)?.let { audioGroups.add(it.groupValues[1]) }
+                  }
+              }
+              val out = ArrayList<Variant>()
+              var i = 0
+              while (i < lines.size) {
+                  val l = lines[i]
+                  if (l.startsWith("#EXT-X-STREAM-INF")) {
+                      var j = i + 1
+                      while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
+                      if (j < lines.size) {
+                          val bw = Regex("(?:^|[:,])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                          val h = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                          val ag = Regex("AUDIO=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
+                          val label = (if (h > 0) "${h}p" else "") + (if (bw > 0) (if (h > 0) " · " else "") + "${bw / 1000} kbps" else "")
+                          out.add(Variant(label.ifEmpty { "Stream" }, resolveUrl(base, lines[j]), h, ag != null && ag in audioGroups))
                       }
+                      i = j
+                  } else i++
+              }
+              return out.distinctBy { it.url }.sortedByDescending { it.height }
+          }
+
+          // Resolutions if url is an HLS master playlist, else empty.
+          fun fetchVariants(url: String): List<Variant> {
+              val (base, text) = fetchText(url) ?: return emptyList()
+              if (!isHls(text)) return emptyList()
+              val lines = text.lines().map { it.trim() }
+              if (lines.none { it.startsWith("#EXT-X-STREAM-INF") }) return emptyList()
+              return parseVariants(base, lines)
+          }
+
+          fun hlsName(url: String): String {
+              val u = Uri.parse(url)
+              val segs = (u.pathSegments ?: emptyList<String>()).map { it.substringBeforeLast('.') }.filter { it.isNotBlank() }
+              val generic = setOf("index", "playlist", "master", "chunklist", "video", "manifest", "stream", "main", "media", "hls", "m3u8")
+              return clean(segs.lastOrNull { it.lowercase() !in generic } ?: (u.host ?: "video"))
+          }
+
+          // Repack (no re-encode) into a regular mp4. Returns false if the device can't.
+          fun remux(src: File, dst: File): Boolean {
+              val ex = MediaExtractor()
+              var mux: MediaMuxer? = null
+              try {
+                  ex.setDataSource(src.path)
+                  mux = MediaMuxer(dst.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                  val map = HashMap<Int, Int>()
+                  for (i in 0 until ex.trackCount) {
+                      val f = ex.getTrackFormat(i)
+                      val m = f.getString(MediaFormat.KEY_MIME) ?: continue
+                      if (m.startsWith("video/") || m.startsWith("audio/")) { map[i] = mux.addTrack(f); ex.selectTrack(i) }
                   }
-                  val out = ArrayList<Variant>()
-                  var i = 0
-                  while (i < lines.size) {
-                      val l = lines[i]
-                      if (l.startsWith("#EXT-X-STREAM-INF")) {
-                          var j = i + 1
-                          while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
-                          if (j < lines.size) {
-                              val bw = Regex("(?:^|[:,])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                              val h = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)?.groupValues?.get(2)?.toIntOrNull() ?: 0
-                              val ag = Regex("AUDIO=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
-                              val abs = runCatching { URI(base).resolve(lines[j]).toString() }.getOrDefault(lines[j])
-                              val label = (if (h > 0) "${h}p" else "") + (if (bw > 0) (if (h > 0) " · " else "") + "${bw / 1000} kbps" else "")
-                              out.add(Variant(label.ifEmpty { "Stream" }, abs, h, ag != null && ag in audioGroups))
-                          }
-                          i = j
-                      } else i++
+                  if (map.isEmpty()) { mux.release(); dst.delete(); return false }
+                  mux.start()
+                  val buf = ByteBuffer.allocate(8 shl 20)
+                  val info = MediaCodec.BufferInfo()
+                  while (true) {
+                      buf.clear()
+                      val n = ex.readSampleData(buf, 0)
+                      if (n < 0) break
+                      val key = (ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                      info.set(0, n, ex.sampleTime, if (key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                      mux.writeSampleData(map[ex.sampleTrackIndex] ?: 0, buf, info)
+                      ex.advance()
                   }
-                  out.distinctBy { it.url }.sortedByDescending { it.height }
+                  mux.stop(); mux.release(); mux = null
+                  return dst.length() > 0
+              } catch (e: Exception) {
+                  try { mux?.release() } catch (_: Exception) {}
+                  dst.delete()
+                  return false
+              } finally {
+                  ex.release()
               }
           }
 
@@ -365,8 +432,7 @@ jobs:
               lateinit var app: Application
               val items = mutableStateListOf<Dl>()
               var maxConc by mutableIntStateOf(2) // 0 = unlimited
-              var limitKB by mutableIntStateOf(0) // 0 = unlimited
-              @Volatile var active = 1
+              var limitKB by mutableIntStateOf(0) // per download, 0 = unlimited
               val main = Handler(Looper.getMainLooper())
               private val pool = Executors.newCachedThreadPool()
               private val tasks = HashMap<String, Task>()
@@ -420,10 +486,14 @@ jobs:
                   maxConc = conc; limitKB = kb
                   prefs.edit().putInt("conc", conc).putInt("limit", kb).apply()
                   ui {
-                      // stream (yt-dlp) downloads can't change speed live, so restart them with the new limit
-                      if (changed) items.filter { it.status == St.DOWNLOADING && it.kind == 2 }.forEach { d ->
-                          tasks.remove(d.id)?.abort(1)
-                          d.status = St.QUEUED; d.speed = 0
+                      // only yt-dlp downloads can't change speed live: restart those with the new limit
+                      if (changed) items.filter { it.status == St.DOWNLOADING }.forEach { d ->
+                          val t = tasks[d.id]
+                          if (t != null && t.ytdl) {
+                              tasks.remove(d.id)
+                              t.abort(1)
+                              d.status = St.QUEUED; d.speed = 0
+                          }
                       }
                       save(); pump()
                   }
@@ -444,13 +514,13 @@ jobs:
                       val t = Task(d); tasks[d.id] = t; pool.execute(t)
                       slots--
                   }
-                  active = maxOf(1, items.count { it.status == St.DOWNLOADING })
                   if (items.any { it.status == St.DOWNLOADING }) {
                       try { ContextCompat.startForegroundService(app, Intent(app, DlService::class.java)) } catch (_: Exception) {}
                   }
               }
 
-              fun perTaskLimit(): Long = if (limitKB <= 0) 0L else limitKB * 1024L / active
+              // limit applies to EACH download
+              fun perTaskLimit(): Long = if (limitKB <= 0) 0L else limitKB * 1024L
 
               fun finish(t: Task, st: St, err: String) {
                   if (tasks[t.d.id] !== t) return
@@ -477,6 +547,9 @@ jobs:
                   Thread {
                       if (delFile && d.path.isNotBlank()) File(d.path).delete()
                       File(dir, ".tmp/${d.id}.part").delete()
+                      File(dir, ".tmp/${d.id}.hls").delete()
+                      File(dir, ".tmp/${d.id}.idx").delete()
+                      File(dir, ".tmp/${d.id}.mp4").delete()
                       File(dir, ".tmp/${d.id}").deleteRecursively()
                   }.start()
                   save(); pump()
@@ -516,12 +589,38 @@ jobs:
           class Task(val d: Dl) : Runnable {
               @Volatile var cancel = 0 // 1 pause, 2 stop, 3 remove
               @Volatile var call: Call? = null
+              @Volatile var ytdl = false
               val pid = d.id + "-" + System.nanoTime()
+
+              // throttle state (per download)
+              private var win = 0L
+              private var winB = 0L
+              private var tick = 0L
+              private var tickB = 0L
 
               fun abort(c: Int) {
                   cancel = c
                   call?.cancel()
-                  if (d.kind == 2) try { YoutubeDL.getInstance().destroyProcessById(pid) } catch (_: Throwable) {}
+                  if (ytdl) try { YoutubeDL.getInstance().destroyProcessById(pid) } catch (_: Throwable) {}
+              }
+
+              // call after reading n bytes: applies the speed limit, updates speed; returns true on a UI tick
+              private fun throttle(n: Int): Boolean {
+                  winB += n; tickB += n
+                  var now = System.currentTimeMillis()
+                  if (win == 0L) { win = now; tick = now }
+                  val lim = Engine.perTaskLimit()
+                  if (lim > 0) {
+                      val wait = winB * 1000 / lim - (now - win)
+                      if (wait > 0) { Thread.sleep(minOf(wait, 1000L)); now = System.currentTimeMillis() }
+                      if (now - win >= 1000) { win = now; winB = 0 }
+                  } else { win = now; winB = 0 }
+                  if (now - tick >= 500) {
+                      d.speed = tickB * 1000 / (now - tick); tick = now; tickB = 0
+                      Engine.save()
+                      return true
+                  }
+                  return false
               }
 
               override fun run() {
@@ -571,6 +670,7 @@ jobs:
                   MediaScannerConnection.scanFile(Engine.app, arrayOf(out.path), null, null)
               }
 
+              // ---------- plain files ----------
               private fun runFile() {
                   val tmp = File(Engine.dir, ".tmp").apply { mkdirs() }
                   File(tmp, ".nomedia").createNewFile()
@@ -582,6 +682,15 @@ jobs:
                           if (cancel != 0 || ++attempts >= 4 || e.message?.startsWith("HTTP") == true) throw e
                           Thread.sleep(1500L * attempts)
                       }
+                  }
+                  // safety net: the "file" was really a playlist -> hand over to the video downloader
+                  val hd = ByteArray(7)
+                  val hn = part.inputStream().use { it.read(hd) }
+                  if (hn == 7 && hd.decodeToString() == "#EXTM3U") {
+                      part.delete()
+                      d.kind = 2; d.name = clean(d.userName); d.done = 0; d.total = -1
+                      runStream()
+                      return
                   }
                   finalize(Engine.moveInto(part, d.name.ifBlank { "download" }))
               }
@@ -606,33 +715,157 @@ jobs:
                       FileOutputStream(part, append).use { o ->
                           val inp = body.byteStream()
                           val buf = ByteArray(65536)
-                          var win = System.currentTimeMillis(); var winB = 0L
-                          var tick = win; var tickB = 0L
                           while (true) {
                               if (cancel != 0) throw IOException("cancelled")
                               val n = inp.read(buf)
                               if (n < 0) break
                               o.write(buf, 0, n)
-                              d.done += n; winB += n; tickB += n
-                              var now = System.currentTimeMillis()
-                              val lim = Engine.perTaskLimit()
-                              if (lim > 0) {
-                                  val wait = winB * 1000 / lim - (now - win)
-                                  if (wait > 0) { Thread.sleep(minOf(wait, 1000L)); now = System.currentTimeMillis() }
-                                  if (now - win >= 1000) { win = now; winB = 0 }
-                              } else { win = now; winB = 0 }
-                              if (now - tick >= 500) {
-                                  d.speed = tickB * 1000 / (now - tick); tick = now; tickB = 0
-                                  d.progress = if (d.total > 0) d.done.toFloat() / d.total else -1f
-                                  Engine.save()
-                              }
+                              d.done += n
+                              if (throttle(n)) d.progress = if (d.total > 0) d.done.toFloat() / d.total else -1f
                           }
                       }
                       if (d.total > 0 && d.done < d.total) throw IOException("Connection closed early")
                   }
               }
 
+              // ---------- streams ----------
               private fun runStream() {
+                  val low = d.url.lowercase().substringBefore('?')
+                  if (!low.endsWith(".mpd") && runHls()) return
+                  runYtdl()
+              }
+
+              private fun fetchSeg(u: String): ByteArray {
+                  var last: Exception? = null
+                  for (a in 0 until 4) {
+                      try {
+                          val c = Engine.http.newCall(Request.Builder().url(u).header("User-Agent", UA).build())
+                          call = c
+                          return c.execute().use { r ->
+                              if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
+                              val bos = ByteArrayOutputStream()
+                              val inp = r.body!!.byteStream()
+                              val buf = ByteArray(32768)
+                              while (true) {
+                                  if (cancel != 0) throw IOException("cancelled")
+                                  val n = inp.read(buf)
+                                  if (n < 0) break
+                                  bos.write(buf, 0, n)
+                                  throttle(n)
+                              }
+                              bos.toByteArray()
+                          }
+                      } catch (e: Exception) {
+                          last = e
+                          if (cancel != 0 || e.message?.startsWith("HTTP 4") == true) throw e
+                          Thread.sleep(1000L * (a + 1))
+                      }
+                  }
+                  throw last ?: IOException("Segment failed")
+              }
+
+              private fun decrypt(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
+                  val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                  c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                  return c.doFinal(data)
+              }
+
+              // Our own downloader for plain VOD HLS. Returns false (nothing done) if the playlist is something we don't handle.
+              private fun runHls(): Boolean {
+                  var (url, text) = fetchText(d.url) ?: return false
+                  if (!isHls(text)) return false
+                  var lines = text.lines().map { it.trim() }
+                  if (lines.any { it.startsWith("#EXT-X-STREAM-INF") }) {
+                      val vs = parseVariants(url, lines)
+                      if (vs.isEmpty()) return false
+                      val want = Regex("height<=(\\d+)").find(d.fmt)?.groupValues?.get(1)?.toIntOrNull()
+                      val v = (if (want != null) vs.firstOrNull { it.height in 1..want } else null) ?: vs.first()
+                      if (v.sepAudio) return false
+                      val t2 = fetchText(v.url) ?: return false
+                      url = t2.first; text = t2.second
+                      if (!isHls(text)) return false
+                      lines = text.lines().map { it.trim() }
+                      if (lines.any { it.startsWith("#EXT-X-STREAM-INF") }) return false
+                  }
+                  val segs = ArrayList<String>()
+                  var mapUri: String? = null
+                  var keyUri: String? = null
+                  var keyIv: String? = null
+                  var seq = 0L
+                  var ended = false
+                  var bad = false
+                  var keys = 0
+                  for (l in lines) {
+                      when {
+                          l.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> seq = l.substringAfter(':').trim().toLongOrNull() ?: 0L
+                          l.startsWith("#EXT-X-MAP:") -> { mapUri = attr(l, "URI"); if (l.contains("BYTERANGE")) bad = true }
+                          l.startsWith("#EXT-X-KEY:") -> {
+                              val m = attr(l, "METHOD")
+                              keys++
+                              if (m == "AES-128") { keyUri = attr(l, "URI"); keyIv = attr(l, "IV") } else if (m != "NONE") bad = true
+                          }
+                          l.startsWith("#EXT-X-BYTERANGE") -> bad = true
+                          l.startsWith("#EXT-X-ENDLIST") -> ended = true
+                          l.isNotEmpty() && !l.startsWith("#") -> segs.add(l)
+                      }
+                  }
+                  if (bad || !ended || segs.isEmpty() || keys > 1) return false
+
+                  val mu = mapUri
+                  val ku = keyUri
+                  val iv0 = keyIv
+                  val base = url
+                  if (d.name.isBlank()) d.name = if (d.userName.isNotBlank()) clean(d.userName) else hlsName(d.url)
+                  val tmp = File(Engine.dir, ".tmp").apply { mkdirs() }
+                  File(tmp, ".nomedia").createNewFile()
+                  val raw = File(tmp, "${d.id}.hls")
+                  val idxF = File(tmp, "${d.id}.idx")
+                  var start = if (raw.exists() && idxF.exists()) (idxF.readText().trim().toIntOrNull() ?: 0) else 0
+                  if (start <= 0 || start > segs.size) { start = 0; raw.delete() }
+                  val key = if (ku != null) fetchSeg(resolveUrl(base, ku)) else null
+                  val ivFixed = if (iv0 != null) hexBytes(iv0) else null
+                  d.done = if (start > 0) raw.length() else 0L
+                  d.total = -1L
+                  d.progress = if (start > 0) start.toFloat() / segs.size else 0f
+                  val first = start
+
+                  FileOutputStream(raw, start > 0).use { out ->
+                      if (first == 0 && mu != null) out.write(fetchSeg(resolveUrl(base, mu)))
+                      for (i in first until segs.size) {
+                          if (cancel != 0) throw IOException("cancelled")
+                          var data = fetchSeg(resolveUrl(base, segs[i]))
+                          if (key != null) {
+                              val iv = ivFixed ?: ByteArray(16).also { b ->
+                                  var v = seq + i
+                                  for (k in 15 downTo 8) { b[k] = (v and 0xFF).toByte(); v = v shr 8 }
+                              }
+                              data = decrypt(data, key, iv)
+                          }
+                          out.write(data)
+                          out.flush()
+                          idxF.writeText((i + 1).toString())
+                          d.done += data.size
+                          d.progress = (i + 1f) / segs.size
+                          d.total = (d.done / d.progress).toLong()
+                          Engine.save()
+                      }
+                  }
+
+                  d.progress = -1f; d.speed = 0
+                  val name0 = if (d.userName.isNotBlank()) clean(d.userName) else hlsName(d.url)
+                  val tmpMp4 = File(tmp, "${d.id}.mp4")
+                  val ok = remux(raw, tmpMp4)
+                  val src: File
+                  if (ok) { raw.delete(); src = tmpMp4 } else { tmpMp4.delete(); src = raw }
+                  val ext = if (ok || mu != null) "mp4" else "ts"
+                  idxF.delete()
+                  finalize(Engine.moveInto(src, name0.removeSuffix(".$ext") + "." + ext))
+                  return true
+              }
+
+              // yt-dlp + FFmpeg library path (pages, DASH, live, separate-audio masters)
+              private fun runYtdl() {
+                  ytdl = true
                   Engine.ensureYtdl()
                   val tmp = File(Engine.dir, ".tmp/${d.id}").apply { mkdirs() }
                   File(Engine.dir, ".tmp/.nomedia").createNewFile()
@@ -660,6 +893,9 @@ jobs:
                   }
                   val files = tmp.listFiles()?.filter { it.isFile && !Regex("\\.(part|ytdl|temp|tmp)$").containsMatchIn(it.name) } ?: emptyList()
                   val f = files.maxByOrNull { it.length() } ?: throw IllegalStateException("No output file produced")
+                  val hd = ByteArray(7)
+                  val hn = f.inputStream().use { it.read(hd) }
+                  if (hn == 7 && hd.decodeToString() == "#EXTM3U") throw IllegalStateException("Got a playlist file instead of a video")
                   val ext = f.extension.ifEmpty { "mp4" }
                   val base = (if (d.userName.isNotBlank()) clean(d.userName) else f.nameWithoutExtension).removeSuffix(".$ext")
                   val out = Engine.moveInto(f, "$base.$ext")
@@ -857,10 +1093,10 @@ jobs:
                           }
                           OutlinedTextField(
                               value = lim, onValueChange = { lim = it.filter(Char::isDigit).take(7) }, singleLine = true,
-                              label = { Text("Speed limit KB/s (blank = none)") }, colors = fieldColors(),
+                              label = { Text("Speed limit per download, KB/s (blank = none)") }, colors = fieldColors(),
                               keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                           )
-                          Text("Video streams restart briefly when the limit changes (progress is kept).", fontSize = 11.sp, color = GreyText2)
+                          Text("Applies live. Only videos handled by yt-dlp restart briefly (progress is kept).", fontSize = 11.sp, color = GreyText2)
                           TextButton(onClick = { Engine.clearFinished() }) { Text("Clear finished from list", color = Color.White) }
                       }
                   },
@@ -1028,3 +1264,4 @@ jobs:
         with:
           name: GreyDM
           path: proj/app/build/outputs/apk/debug/*.apk
+        
