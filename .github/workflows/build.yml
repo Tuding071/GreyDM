@@ -92,6 +92,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
               <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
               <application
@@ -141,7 +142,7 @@ jobs:
                           <data android:pathPattern=".*\\.m3u8"/>
                       </intent-filter>
                   </activity>
-                  <service android:name=".DlService" android:exported="false" android:foregroundServiceType="dataSync"/>
+                  <service android:name=".DlService" android:exported="false" android:stopWithTask="false" android:foregroundServiceType="dataSync"/>
                   <provider android:name="androidx.core.content.FileProvider" android:authorities="com.grey.dm.fp"
                       android:exported="false" android:grantUriPermissions="true">
                       <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/>
@@ -150,7 +151,7 @@ jobs:
           </manifest>
           EOF
           cat > app/src/main/java/com/grey/dm/MainActivity.kt <<'EOF'
-          @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+          @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
           package com.grey.dm
 
           import android.Manifest
@@ -171,12 +172,14 @@ jobs:
           import android.media.MediaMuxer
           import android.media.MediaScannerConnection
           import android.net.Uri
+          import android.net.wifi.WifiManager
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
           import android.os.Handler
           import android.os.IBinder
           import android.os.Looper
+          import android.os.PowerManager
           import android.provider.Settings
           import android.webkit.MimeTypeMap
           import android.widget.Toast
@@ -187,7 +190,6 @@ jobs:
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.horizontalScroll
           import androidx.compose.foundation.interaction.MutableInteractionSource
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
@@ -195,12 +197,14 @@ jobs:
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.*
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.platform.LocalClipboardManager
           import androidx.compose.ui.platform.LocalContext
@@ -423,9 +427,14 @@ jobs:
           }
 
           object Perm {
-              fun has(c: Context): Boolean =
+              fun storage(c: Context): Boolean =
                   if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
                   else ContextCompat.checkSelfPermission(c, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+              fun has(c: Context): Boolean = storage(c)
+              fun notif(c: Context): Boolean =
+                  Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(c, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+              fun battery(c: Context): Boolean =
+                  c.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(c.packageName)
           }
 
           object Engine {
@@ -460,7 +469,8 @@ jobs:
                           d.status = St.valueOf(o.optString("st", "QUEUED"))
                           d.progress = o.optDouble("p", 0.0).toFloat(); d.done = o.optLong("done"); d.total = o.optLong("total", -1)
                           d.error = o.optString("err"); d.path = o.optString("path")
-                          if (d.status == St.DOWNLOADING) d.status = St.PAUSED
+                          // interrupted by the system killing the app: pick up again automatically
+                          if (d.status == St.DOWNLOADING) d.status = St.QUEUED
                           list.add(d)
                       }
                       items.addAll(list.sortedByDescending { it.created })
@@ -917,6 +927,8 @@ jobs:
 
           class DlService : Service() {
               private val h = Handler(Looper.getMainLooper())
+              private var wl: PowerManager.WakeLock? = null
+              private var wf: WifiManager.WifiLock? = null
               private val tick = object : Runnable {
                   override fun run() {
                       if (Engine.items.none { it.status == St.DOWNLOADING || it.status == St.QUEUED }) { stopSelf(); return }
@@ -927,10 +939,32 @@ jobs:
               override fun onBind(i: Intent?): IBinder? = null
               override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
                   ServiceCompat.startForeground(this, 1, build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  locks()
+                  if (i == null) Engine.pump() // restarted by the system after the app was killed
                   h.removeCallbacks(tick); h.post(tick)
-                  return START_NOT_STICKY
+                  return START_STICKY
               }
-              override fun onDestroy() { h.removeCallbacks(tick) }
+              private fun locks() {
+                  try {
+                      if (wl == null) {
+                          wl = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GreyDM:dl")
+                          wl?.setReferenceCounted(false)
+                      }
+                      if (wl?.isHeld == false) wl?.acquire()
+                      if (wf == null) {
+                          val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                          val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                          wf = wm.createWifiLock(mode, "GreyDM:wifi")
+                          wf?.setReferenceCounted(false)
+                      }
+                      if (wf?.isHeld == false) wf?.acquire()
+                  } catch (_: Exception) {}
+              }
+              override fun onDestroy() {
+                  h.removeCallbacks(tick)
+                  try { if (wl?.isHeld == true) wl?.release() } catch (_: Exception) {}
+                  try { if (wf?.isHeld == true) wf?.release() } catch (_: Exception) {}
+              }
               private fun build(): Notification {
                   val act = Engine.items.filter { it.status == St.DOWNLOADING }
                   val text = if (act.isEmpty()) "Waiting…" else "${act.size} downloading · ${fmtSpeed(act.sumOf { it.speed })}"
@@ -966,9 +1000,9 @@ jobs:
               St.QUEUED -> "Queued"
               St.DOWNLOADING -> {
                   val p = ArrayList<String>()
-                  if (d.progress >= 0f) p.add("${(d.progress * 100).toInt()}%")
-                  if (d.total > 0) p.add("${fmtSize(d.done)} / ${fmtSize(d.total)}") else if (d.done > 0) p.add(fmtSize(d.done))
                   if (d.speed > 0) p.add(fmtSpeed(d.speed))
+                  if (d.total > 0) p.add("${fmtSize(d.done)} / ${fmtSize(d.total)}") else if (d.done > 0) p.add(fmtSize(d.done))
+                  if (d.progress >= 0f) p.add("${(d.progress * 100).toInt()}%")
                   if (d.speed > 0 && d.total > d.done) p.add(fmtTime((d.total - d.done) / d.speed))
                   if (p.isEmpty()) "Starting…" else p.joinToString(" · ")
               }
@@ -985,12 +1019,24 @@ jobs:
           )
 
           @Composable
+          fun QRow(text: String, selected: Boolean, onClick: () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                      .background(if (selected) Color.White else GreyHi).clickable { onClick() }
+                      .padding(horizontal = 14.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(text, color = if (selected) Color.Black else Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                  if (selected) Icon(Icons.Default.Check, null, tint = Color.Black)
+              }
+          }
+
+          @Composable
           fun EditorCard(url0: String, onCancel: () -> Unit, onAdd: (String, String, String) -> Unit) {
               var name by remember { mutableStateOf("") }
               var url by remember(url0) { mutableStateOf(url0) }
               var variants by remember { mutableStateOf<List<Variant>>(emptyList()) }
               var sel by remember { mutableIntStateOf(-1) }
-              var fmt by remember { mutableStateOf("") }
               var master by remember { mutableStateOf("") }
               var internal by remember { mutableStateOf("") }
               var loading by remember { mutableStateOf(false) }
@@ -998,7 +1044,7 @@ jobs:
 
               LaunchedEffect(url) {
                   if (url == internal) return@LaunchedEffect
-                  variants = emptyList(); sel = -1; fmt = ""; master = ""; loading = false
+                  variants = emptyList(); sel = -1; master = ""; loading = false
                   if (!url.trim().startsWith("http", true)) return@LaunchedEffect
                   delay(700)
                   loading = true
@@ -1034,34 +1080,29 @@ jobs:
                           })
                       if (loading) Text("Checking for quality options…", fontSize = 12.sp, color = GreyText2)
                       if (variants.isNotEmpty()) {
-                          Text("Quality (tap to pick, none = best)", fontSize = 13.sp, color = GreyText2)
-                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Text("Quality", fontSize = 13.sp, color = GreyText2)
+                          Column(
+                              Modifier.fillMaxWidth().heightIn(max = 240.dp).verticalScroll(rememberScrollState()),
+                              verticalArrangement = Arrangement.spacedBy(6.dp)
+                          ) {
+                              QRow("Auto · best quality", sel == -1) { sel = -1; internal = master; url = master }
                               variants.forEachIndexed { i, v ->
-                                  FilterChip(
-                                      selected = sel == i,
-                                      onClick = {
-                                          sel = i
-                                          if (v.sepAudio && v.height > 0) {
-                                              // audio is a separate track: keep master link and pick the resolution by filter
-                                              fmt = "bv*[height<=${v.height}]+ba/b[height<=${v.height}]"
-                                              internal = master; url = master
-                                          } else {
-                                              fmt = ""
-                                              internal = v.url; url = v.url
-                                          }
-                                      },
-                                      label = { Text(v.label) },
-                                      colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color.White, selectedLabelColor = Color.Black)
-                                  )
+                                  QRow(v.label + (if (v.sepAudio) " · separate audio" else ""), sel == i) {
+                                      sel = i; internal = v.url; url = v.url
+                                  }
                               }
                           }
+                          Text(
+                              "Caution: a picked resolution may download with no sound if its audio is a separate track. Auto keeps the sound.",
+                              fontSize = 12.sp, color = Color(0xFFFFB74D)
+                          )
                       }
                       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                           TextButton(onClick = onCancel) { Text("Cancel", color = Color.White) }
                           Spacer(Modifier.width(8.dp))
                           Button(
                               enabled = url.trim().startsWith("http", true),
-                              onClick = { onAdd(name, url.trim(), fmt) },
+                              onClick = { onAdd(name, url.trim(), "") },
                               colors = ButtonDefaults.buttonColors(
                                   containerColor = Color.White, contentColor = Color.Black,
                                   disabledContainerColor = GreyTrack, disabledContentColor = GreyText2
@@ -1082,7 +1123,7 @@ jobs:
                   text = {
                       Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                           Text("Simultaneous downloads", fontSize = 13.sp, color = GreyText2)
-                          Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                               listOf(1, 2, 3, 4, 5, 8, 0).forEach { n ->
                                   FilterChip(
                                       selected = conc == n, onClick = { conc = n },
@@ -1155,7 +1196,7 @@ jobs:
           }
 
           @Composable
-          fun Home(granted: Boolean, onGrant: () -> Unit) {
+          fun Home(granted: Boolean, extra: Boolean, onGrant: () -> Unit) {
               var showEditor by remember { mutableStateOf(false) }
               var editorUrl by remember { mutableStateOf("") }
               var showSettings by remember { mutableStateOf(false) }
@@ -1178,17 +1219,29 @@ jobs:
                       ) { Icon(Icons.Default.ContentPaste, "Paste link") }
                   }
               ) { pad ->
-                  Box(Modifier.padding(pad).fillMaxSize()) {
-                      if (!granted) {
-                          Column(Modifier.align(Alignment.Center).padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                              Text("GreyDM needs access to storage to save downloads to the GreyDM folder.", color = GreyText2)
-                              Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) { Text("Grant access") }
+                  Column(Modifier.padding(pad).fillMaxSize()) {
+                      if (granted && extra) Card(
+                          colors = CardDefaults.cardColors(containerColor = GreyCard), shape = RoundedCornerShape(14.dp),
+                          modifier = Modifier.fillMaxWidth().padding(12.dp, 4.dp, 12.dp, 4.dp)
+                      ) {
+                          Row(Modifier.padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Text("Allow notifications and unrestricted battery so downloads keep running with the screen off.",
+                                  fontSize = 12.sp, color = GreyText2, modifier = Modifier.weight(1f))
+                              TextButton(onClick = onGrant) { Text("Allow", color = Color.White) }
                           }
-                      } else if (Engine.items.isEmpty()) {
-                          Text("Tap paste to add a link,\nor share a link to GreyDM from your browser.", color = GreyText2, modifier = Modifier.align(Alignment.Center).padding(32.dp))
-                      } else {
-                          LazyColumn(contentPadding = PaddingValues(12.dp, 4.dp, 12.dp, 96.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                              items(Engine.items, key = { it.id }) { DlRow(it) }
+                      }
+                      Box(Modifier.weight(1f).fillMaxWidth()) {
+                          if (!granted) {
+                              Column(Modifier.align(Alignment.Center).padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                  Text("GreyDM needs storage access to save into the GreyDM folder, plus notification and battery permissions so downloads keep running in the background.", color = GreyText2)
+                                  Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) { Text("Grant permissions") }
+                              }
+                          } else if (Engine.items.isEmpty()) {
+                              Text("Tap paste to add a link,\nor share a link to GreyDM from your browser.", color = GreyText2, modifier = Modifier.align(Alignment.Center).padding(32.dp))
+                          } else {
+                              LazyColumn(contentPadding = PaddingValues(12.dp, 4.dp, 12.dp, 96.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  items(Engine.items, key = { it.id }) { DlRow(it) }
+                              }
                           }
                       }
                   }
@@ -1201,26 +1254,51 @@ jobs:
 
           class MainActivity : ComponentActivity() {
               private val granted = mutableStateOf(false)
+              private val extra = mutableStateOf(false)
+              private var chain = false
+              private val asked = HashSet<String>()
               private val reqStorage = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
-              private val reqNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+              private val reqNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   enableEdgeToEdge(statusBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT), navigationBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT))
-                  if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
-                      reqNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
-                  setContent { GreyTheme { Home(granted.value) { grant() } } }
+                  val p = getSharedPreferences("dm", 0)
+                  if (!p.getBoolean("pa", false)) { chain = true; p.edit().putBoolean("pa", true).apply() }
+                  setContent { GreyTheme { Home(granted.value, extra.value) { grant() } } }
               }
               override fun onResume() { super.onResume(); refresh() }
+
+              private fun ok(s: String): Boolean = when (s) {
+                  "storage" -> Perm.storage(this)
+                  "notif" -> Perm.notif(this)
+                  else -> Perm.battery(this)
+              }
               private fun refresh() {
-                  granted.value = Perm.has(this)
+                  granted.value = Perm.storage(this)
+                  extra.value = !Perm.notif(this) || !Perm.battery(this)
                   if (granted.value) { Engine.dir.mkdirs(); Engine.pump() }
+                  if (chain) next()
               }
-              private fun grant() {
-                  if (Build.VERSION.SDK_INT >= 30)
-                      startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
-                  else reqStorage.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+              // asks for the next missing permission, one at a time (each at most once per chain)
+              private fun next() {
+                  val step = listOf("storage", "notif", "battery").firstOrNull { it !in asked && !ok(it) }
+                  if (step == null) { chain = false; return }
+                  asked.add(step)
+                  try {
+                      when (step) {
+                          "storage" ->
+                              if (Build.VERSION.SDK_INT >= 30)
+                                  startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                              else reqStorage.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                          "notif" -> if (Build.VERSION.SDK_INT >= 33) reqNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
+                          else -> startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                      }
+                  } catch (e: Exception) {
+                      if (step == "battery") try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) {}
+                  }
               }
+              private fun grant() { chain = true; asked.clear(); next() }
           }
 
           class AddActivity : ComponentActivity() {
@@ -1264,4 +1342,3 @@ jobs:
         with:
           name: GreyDM
           path: proj/app/build/outputs/apk/debug/*.apk
-        
