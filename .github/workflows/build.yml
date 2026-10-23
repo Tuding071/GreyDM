@@ -3,6 +3,8 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -12,6 +14,16 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Test keystore
+        run: |
+          if [ ! -f test.keystore ]; then
+            keytool -genkeypair -keystore test.keystore -storepass android -keypass android -alias test -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=GreyDM Test, O=Test, C=US"
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add test.keystore
+            git commit -m "Add test keystore [skip ci]"
+            git push || echo "Could not push the keystore. Check workflow permissions."
+          fi
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
@@ -53,6 +65,22 @@ jobs:
                   versionCode = 1
                   versionName = "1.0"
                   ndk { abiFilters += listOf("arm64-v8a") }
+              }
+              signingConfigs {
+                  create("test") {
+                      storeFile = rootProject.file("../test.keystore")
+                      storePassword = "android"
+                      keyAlias = "test"
+                      keyPassword = "android"
+                  }
+              }
+              buildTypes {
+                  release { signingConfig = signingConfigs.getByName("test") }
+                  debug { signingConfig = signingConfigs.getByName("test") }
+              }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
               }
               buildFeatures { compose = true }
               compileOptions {
@@ -200,6 +228,7 @@ jobs:
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.*
+          import androidx.compose.material.icons.outlined.PushPin as PinOutline
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
@@ -271,7 +300,12 @@ jobs:
               var kind = 0 // 0 unknown, 1 file, 2 stream
           }
 
+          // height = quality class (shorter side of the resolution, so vertical videos count correctly)
           class Variant(val label: String, val url: String, val height: Int, val sepAudio: Boolean)
+
+          class SavedName(val name: String, p: Boolean) {
+              var pinned by mutableStateOf(p)
+          }
 
           fun clean(s: String): String =
               s.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").trim().take(150)
@@ -362,7 +396,8 @@ jobs:
                       while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
                       if (j < lines.size) {
                           val bw = Regex("(?:^|[:,])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                          val h = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                          val rm = Regex("RESOLUTION=(\\d+)x(\\d+)").find(l)
+                          val h = if (rm != null) minOf(rm.groupValues[1].toIntOrNull() ?: 0, rm.groupValues[2].toIntOrNull() ?: 0) else 0
                           val ag = Regex("AUDIO=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
                           val label = (if (h > 0) "${h}p" else "") + (if (bw > 0) (if (h > 0) " · " else "") + "${bw / 1000} kbps" else "")
                           out.add(Variant(label.ifEmpty { "Stream" }, resolveUrl(base, lines[j]), h, ag != null && ag in audioGroups))
@@ -380,6 +415,16 @@ jobs:
               val lines = text.lines().map { it.trim() }
               if (lines.none { it.startsWith("#EXT-X-STREAM-INF") }) return emptyList()
               return parseVariants(base, lines)
+          }
+
+          // Preferred quality: exact match, else the closest higher one, else the closest lower one. -1 = none.
+          fun pickPref(vs: List<Variant>, pref: Int): Int {
+              if (pref <= 0) return -1
+              val c = vs.withIndex().filter { it.value.height > 0 }
+              if (c.isEmpty()) return -1
+              c.firstOrNull { it.value.height == pref }?.let { return it.index }
+              c.filter { it.value.height > pref }.minByOrNull { it.value.height }?.let { return it.index }
+              return c.filter { it.value.height < pref }.maxByOrNull { it.value.height }?.index ?: -1
           }
 
           fun hlsName(url: String): String {
@@ -440,8 +485,10 @@ jobs:
           object Engine {
               lateinit var app: Application
               val items = mutableStateListOf<Dl>()
+              val names = mutableStateListOf<SavedName>()
               var maxConc by mutableIntStateOf(2) // 0 = unlimited
               var limitKB by mutableIntStateOf(0) // per download, 0 = unlimited
+              var prefQ by mutableIntStateOf(0) // preferred video quality, 0 = auto (best)
               val main = Handler(Looper.getMainLooper())
               private val pool = Executors.newCachedThreadPool()
               private val tasks = HashMap<String, Task>()
@@ -459,6 +506,14 @@ jobs:
                   app = a
                   maxConc = prefs.getInt("conc", 2)
                   limitKB = prefs.getInt("limit", 0)
+                  prefQ = prefs.getInt("pq", 0)
+                  try {
+                      val na = JSONArray(prefs.getString("names", "[]"))
+                      for (i in 0 until na.length()) {
+                          val o = na.getJSONObject(i)
+                          names.add(SavedName(o.getString("n"), o.optBoolean("p", false)))
+                      }
+                  } catch (_: Exception) {}
                   try {
                       val arr = JSONArray(prefs.getString("items", "[]"))
                       val list = ArrayList<Dl>()
@@ -491,10 +546,26 @@ jobs:
                   prefs.edit().putString("items", arr.toString()).apply()
               }
 
-              fun setLimits(conc: Int, kb: Int) {
+              // ----- saved names (one can be pinned: it auto-fills the file name) -----
+              private fun saveNames() {
+                  val a = JSONArray()
+                  names.forEach { a.put(JSONObject().put("n", it.name).put("p", it.pinned)) }
+                  prefs.edit().putString("names", a.toString()).apply()
+              }
+              fun pinnedName(): String = names.firstOrNull { it.pinned }?.name ?: ""
+              fun addName(n: String) { names.add(SavedName(n, false)); saveNames() }
+              fun togglePin(sn: SavedName) {
+                  val was = sn.pinned
+                  names.forEach { it.pinned = false }
+                  sn.pinned = !was
+                  saveNames()
+              }
+              fun delName(sn: SavedName) { names.remove(sn); saveNames() }
+
+              fun setLimits(conc: Int, kb: Int, q: Int) {
                   val changed = kb != limitKB
-                  maxConc = conc; limitKB = kb
-                  prefs.edit().putInt("conc", conc).putInt("limit", kb).apply()
+                  maxConc = conc; limitKB = kb; prefQ = q
+                  prefs.edit().putInt("conc", conc).putInt("limit", kb).putInt("pq", q).apply()
                   ui {
                       // only yt-dlp downloads can't change speed live: restart those with the new limit
                       if (changed) items.filter { it.status == St.DOWNLOADING }.forEach { d ->
@@ -788,8 +859,8 @@ jobs:
                   if (lines.any { it.startsWith("#EXT-X-STREAM-INF") }) {
                       val vs = parseVariants(url, lines)
                       if (vs.isEmpty()) return false
-                      val want = Regex("height<=(\\d+)").find(d.fmt)?.groupValues?.get(1)?.toIntOrNull()
-                      val v = (if (want != null) vs.firstOrNull { it.height in 1..want } else null) ?: vs.first()
+                      val pi = pickPref(vs, Engine.prefQ)
+                      val v = if (pi >= 0) vs[pi] else vs.first()
                       if (v.sepAudio) return false
                       val t2 = fetchText(v.url) ?: return false
                       url = t2.first; text = t2.second
@@ -885,7 +956,8 @@ jobs:
                   req.addOption("--newline")
                   req.addOption("--no-mtime")
                   if (d.fmt.isNotBlank()) req.addOption("-f", d.fmt)
-                  req.addOption("-S", "vcodec:h264,res,acodec:m4a")
+                  val res = if (Engine.prefQ > 0) "res:${Engine.prefQ}" else "res"
+                  req.addOption("-S", "vcodec:h264,$res,acodec:m4a")
                   req.addOption("--merge-output-format", "mp4")
                   req.addOption("--remux-video", "mp4")
                   req.addOption("--concurrent-fragments", "4")
@@ -1033,14 +1105,18 @@ jobs:
 
           @Composable
           fun EditorCard(url0: String, onCancel: () -> Unit, onAdd: (String, String, String) -> Unit) {
-              var name by remember { mutableStateOf("") }
+              var name by remember { mutableStateOf(Engine.pinnedName()) }
               var url by remember(url0) { mutableStateOf(url0) }
               var variants by remember { mutableStateOf<List<Variant>>(emptyList()) }
               var sel by remember { mutableIntStateOf(-1) }
               var master by remember { mutableStateOf("") }
               var internal by remember { mutableStateOf("") }
               var loading by remember { mutableStateOf(false) }
+              var open by remember { mutableStateOf(false) }
+              var nn by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
               val clip = LocalClipboardManager.current
+              val pinned = Engine.pinnedName()
 
               LaunchedEffect(url) {
                   if (url == internal) return@LaunchedEffect
@@ -1052,14 +1128,94 @@ jobs:
                   variants = found
                   master = url.trim()
                   loading = false
+                  val pi = pickPref(found, Engine.prefQ)
+                  if (pi >= 0) { sel = pi; internal = found[pi].url; url = found[pi].url }
               }
 
               Card(
                   colors = CardDefaults.cardColors(containerColor = GreyCard),
                   shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)
               ) {
-                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                       Text("Add download", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+
+                      Row(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(GreyHi)
+                              .clickable { open = !open }.padding(horizontal = 12.dp, vertical = 10.dp),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Icon(Icons.Default.Bookmarks, null, tint = GreyText2, modifier = Modifier.size(18.dp))
+                          Spacer(Modifier.width(8.dp))
+                          Text("Saved names", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                          if (pinned.isNotEmpty()) Row(
+                              Modifier.widthIn(max = 130.dp).clip(RoundedCornerShape(12.dp)).background(Color.White)
+                                  .padding(horizontal = 8.dp, vertical = 2.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Icon(Icons.Default.PushPin, null, tint = GreyBg, modifier = Modifier.size(14.dp))
+                              Spacer(Modifier.width(4.dp))
+                              Text(pinned, color = GreyBg, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          }
+                          Spacer(Modifier.width(6.dp))
+                          Icon(if (open) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null, tint = GreyText2)
+                      }
+
+                      if (open) Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFF1C1C1E)).padding(8.dp)) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              OutlinedTextField(
+                                  value = nn, onValueChange = { nn = it; err = "" }, singleLine = true,
+                                  placeholder = { Text("New name") }, colors = fieldColors(), modifier = Modifier.weight(1f)
+                              )
+                              Spacer(Modifier.width(6.dp))
+                              Button(
+                                  onClick = {
+                                      val v = nn.trim()
+                                      if (v.isEmpty()) err = "Enter a name first"
+                                      else if (Engine.names.any { it.name.equals(v, true) }) err = "That name is already saved"
+                                      else { Engine.addName(v); nn = ""; err = "" }
+                                  },
+                                  colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
+                              ) {
+                                  Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+                                  Spacer(Modifier.width(4.dp))
+                                  Text("Add")
+                              }
+                          }
+                          if (err.isNotEmpty()) Text(err, fontSize = 13.sp, color = Color(0xFFFF8A80), modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+                          Spacer(Modifier.height(4.dp))
+                          Engine.names.sortedByDescending { it.pinned }.forEach { sn ->
+                              Row(
+                                  Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(if (sn.pinned) GreyHi else Color.Transparent),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Text(
+                                      sn.name, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                      modifier = Modifier.weight(1f).clickable { name = sn.name }.padding(horizontal = 10.dp, vertical = 12.dp)
+                                  )
+                                  IconButton(onClick = {
+                                      val old = Engine.pinnedName()
+                                      Engine.togglePin(sn)
+                                      if (name.isEmpty() || name == old) name = Engine.pinnedName()
+                                  }) {
+                                      Icon(
+                                          if (sn.pinned) Icons.Default.PushPin else Icons.Outlined.PinOutline, "Pin name",
+                                          tint = if (sn.pinned) Color.White else GreyText2
+                                      )
+                                  }
+                                  IconButton(onClick = {
+                                      val old = Engine.pinnedName()
+                                      val was = sn.pinned
+                                      Engine.delName(sn)
+                                      if (was && name == old) name = ""
+                                  }) { Icon(Icons.Default.Close, "Delete name", tint = GreyText2) }
+                              }
+                          }
+                          Text(
+                              "Tap a name to use it. Pin one to auto-fill every new download.",
+                              fontSize = 12.sp, color = GreyText2, modifier = Modifier.padding(6.dp, 6.dp, 4.dp, 2.dp)
+                          )
+                      }
+
                       OutlinedTextField(
                           value = name, onValueChange = { name = it }, singleLine = true,
                           label = { Text("File name (blank = auto)") }, colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
@@ -1069,6 +1225,8 @@ jobs:
                                   if (!t.isNullOrBlank()) name = t.lines().first().trim()
                               }) { Icon(Icons.Default.ContentPaste, "Paste name") }
                           })
+                      if (pinned.isNotEmpty() && name == pinned) Text("Auto-filled from your pinned name", fontSize = 12.sp, color = GreyText2)
+
                       OutlinedTextField(
                           value = url, onValueChange = { url = it }, maxLines = 3,
                           label = { Text("Link") }, colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
@@ -1116,12 +1274,13 @@ jobs:
           @Composable
           fun SettingsDialog(onClose: () -> Unit) {
               var conc by remember { mutableIntStateOf(Engine.maxConc) }
+              var q by remember { mutableIntStateOf(Engine.prefQ) }
               var lim by remember { mutableStateOf(if (Engine.limitKB > 0) Engine.limitKB.toString() else "") }
               AlertDialog(
                   onDismissRequest = onClose, containerColor = GreyCard,
                   title = { Text("Settings") },
                   text = {
-                      Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                           Text("Simultaneous downloads", fontSize = 13.sp, color = GreyText2)
                           FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                               listOf(1, 2, 3, 4, 5, 8, 0).forEach { n ->
@@ -1138,10 +1297,21 @@ jobs:
                               keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                           )
                           Text("Applies live. Only videos handled by yt-dlp restart briefly (progress is kept).", fontSize = 11.sp, color = GreyText2)
+                          Text("Preferred video quality", fontSize = 13.sp, color = GreyText2)
+                          FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              listOf(0, 1080, 720, 480, 360).forEach { n ->
+                                  FilterChip(
+                                      selected = q == n, onClick = { q = n },
+                                      label = { Text(if (n == 0) "Auto" else "${n}p") },
+                                      colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color.White, selectedLabelColor = Color.Black)
+                                  )
+                              }
+                          }
+                          Text("Preselected when a link offers several qualities. If it's missing, the next higher one is used, then the next lower.", fontSize = 11.sp, color = GreyText2)
                           TextButton(onClick = { Engine.clearFinished() }) { Text("Clear finished from list", color = Color.White) }
                       }
                   },
-                  confirmButton = { TextButton(onClick = { Engine.setLimits(conc, lim.toIntOrNull() ?: 0); onClose() }) { Text("Save", color = Color.White) } },
+                  confirmButton = { TextButton(onClick = { Engine.setLimits(conc, lim.toIntOrNull() ?: 0, q); onClose() }) { Text("Save", color = Color.White) } },
                   dismissButton = { TextButton(onClick = onClose) { Text("Cancel", color = Color.White) } }
               )
           }
@@ -1337,8 +1507,8 @@ jobs:
           }
           EOF
       - name: Build
-        run: cd proj && gradle assembleDebug --no-daemon
+        run: cd proj && gradle assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: GreyDM
-          path: proj/app/build/outputs/apk/debug/*.apk
+          path: proj/app/build/outputs/apk/release/*.apk
